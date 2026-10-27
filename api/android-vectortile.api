@@ -310,7 +310,7 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public static final long DEFAULT_DISK_CACHE_BYTES;
   public static final long DEFAULT_GLYPH_CACHE_BYTES;
   public static final long DEFAULT_SPRITE_CACHE_BYTES;
-  public static final long SOURCE_GRACE_MS;
+  public static final long DATA_WAIT_MS;
   public final com.mapconductor.vectortile.VectorTileProvider$RenderMode getRenderMode();
   public final kotlin.jvm.functions.Function0<kotlin.Unit> getOnGlyphsLoaded();
   public final void setOnGlyphsLoaded(kotlin.jvm.functions.Function0<kotlin.Unit>);
@@ -367,6 +367,14 @@ final class com.mapconductor.vectortile.VectorTileProvider$Flight {
   public final synchronized boolean join();
   public final synchronized void leave();
   public final synchronized boolean abandonIfUnwanted();
+}
+final class com.mapconductor.vectortile.VectorTileProvider$Ink extends java.lang.Enum<com.mapconductor.vectortile.VectorTileProvider$Ink> {
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink COMPLETE;
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink SHORT;
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink AWAITED;
+  public static com.mapconductor.vectortile.VectorTileProvider$Ink[] values();
+  public static com.mapconductor.vectortile.VectorTileProvider$Ink valueOf(java.lang.String);
+  public static kotlin.enums.EnumEntries<com.mapconductor.vectortile.VectorTileProvider$Ink> getEntries();
 }
 final class com.mapconductor.vectortile.VectorTileProvider$Pending {
   public final java.util.concurrent.CompletableFuture<com.mapconductor.vectortile.VectorTileProvider$SourceOutcome> getFuture();

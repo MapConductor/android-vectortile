@@ -149,9 +149,10 @@ class SlowNetworkTest {
             ).use { it.geometryTiles.renderTile(TileRequest(x = x, y = y, z = z))!! }
 
     /**
-     * A tile whose source is slow is drawn without it after the grace, is not
-     * kept, and is asked for again -- through [VectorTileProvider.onSourcesLoaded]
-     * -- once the source lands; the redraw is kept.
+     * A tile whose source takes longer than the provider will wait is drawn
+     * without it, is not kept, and is asked for again -- through
+     * [VectorTileProvider.onSourcesLoaded] -- once the source lands; the
+     * redraw is kept. The wait is shortened here from its ten seconds.
      */
     @Test
     fun aTileDrawnShortOfASlowSourceIsRedrawnWhenItLands() {
@@ -168,6 +169,7 @@ class SlowNetworkTest {
                     tileBytes
                 },
             ).use { provider ->
+                provider.dataWaitMs = 500
                 provider.onSourcesLoaded = { arrived.countDown() }
                 val request = TileRequest(x = 0, y = 0, z = 0)
                 val started = System.nanoTime()

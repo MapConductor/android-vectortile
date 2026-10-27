@@ -538,6 +538,9 @@ class VectorTileProvider private constructor(
          * connection costs a tile drawn short, not a map that never draws.
          */
         internal const val DATA_WAIT_MS: Long = 10_000
+
+        /** Tiles kept between [prepare] and their render; see [prepared]. */
+        private const val MAX_PREPARED = 64
         private const val AWAIT_SLICE_NANOS: Long = 50_000_000
 
         /**
@@ -764,6 +767,11 @@ class VectorTileProvider private constructor(
         isCancelled: () -> Boolean,
     ): ByteArray? = renderTile(request, isCancelled, Content.FULL)
 
+    override fun prepareTile(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+    ) = prepare(request, isCancelled, Content.FULL)
+
     /** What one of this provider's routes serves. */
     private enum class Content { FULL, GEOMETRY, LABELS }
 
@@ -784,6 +792,11 @@ class VectorTileProvider private constructor(
                 request: TileRequest,
                 isCancelled: () -> Boolean,
             ): ByteArray? = renderTile(request, isCancelled, Content.GEOMETRY)
+
+            override fun prepareTile(
+                request: TileRequest,
+                isCancelled: () -> Boolean,
+            ) = prepare(request, isCancelled, Content.GEOMETRY)
         }
 
     /** The labels and icons alone, on a transparent ground. */
@@ -795,7 +808,57 @@ class VectorTileProvider private constructor(
                 request: TileRequest,
                 isCancelled: () -> Boolean,
             ): ByteArray? = renderTile(request, isCancelled, Content.LABELS)
+
+            override fun prepareTile(
+                request: TileRequest,
+                isCancelled: () -> Boolean,
+            ) = prepare(request, isCancelled, Content.LABELS)
         }
+
+    /**
+     * A tile with everything it waited for, ready to draw -- or, in [hit],
+     * already drawn.
+     */
+    private class Ready(
+        val hit: ByteArray? = null,
+        val tiles: List<ByteArray?> = emptyList(),
+        val glyphs: Ink = Ink.COMPLETE,
+        val drawnShortOfSources: Boolean = false,
+        val completeKey: String? = null,
+        val provisionalKey: String? = null,
+        val groundKey: String = "",
+        val fetchSummary: String = "",
+    )
+
+    /**
+     * Tiles [prepare] got ready, waiting for the server to draw them. Bounded:
+     * a tile the map abandoned between the two is never drawn, and its entry
+     * goes when newer ones push it out.
+     */
+    private val prepared =
+        object : LinkedHashMap<Pair<Content, TileRequest>, Ready>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<Content, TileRequest>, Ready>?) =
+                size > MAX_PREPARED
+        }
+
+    /**
+     * Fetches what the tile needs -- its sources, its glyphs and sprite --
+     * waiting for them, and keeps the result for [renderTile].
+     *
+     * The server calls this outside its render slots
+     * ([TileProviderInterface.prepareTile]), so a tile waiting here on a
+     * network that is not answering holds no slot, and a tile on the device
+     * is not queued behind it. The render that follows does not wait again.
+     */
+    private fun prepare(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+        content: Content,
+    ) {
+        if (closed) return
+        val ready = gather(request, isCancelled, content) ?: return
+        synchronized(prepared) { prepared[content to request] = ready }
+    }
 
     private fun renderTile(
         request: TileRequest,
@@ -803,6 +866,68 @@ class VectorTileProvider private constructor(
         content: Content,
     ): ByteArray? {
         if (closed) return null
+        val ready =
+            synchronized(prepared) { prepared.remove(content to request) }
+                ?: gather(request, isCancelled, content)
+                ?: return null
+        ready.hit?.let { return it }
+
+        // The last chance to bail. Past here the work is native and cannot be
+        // interrupted, and it is the part that takes hundreds of milliseconds
+        // -- a tile drawn for a viewport the map has left holds up the tiles
+        // it is waiting for, because the render slots and the GL thread are
+        // shared.
+        if (isCancelled()) {
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "tile ${request.z}/${request.x}/${request.y} dropped before rendering")
+            }
+            return null
+        }
+
+        val tiles = ready.tiles
+        val groundKey = ready.groundKey
+        val drawnShortOfSources = ready.drawnShortOfSources
+        val drawnShortOfGlyphs = ready.glyphs != Ink.COMPLETE
+        val renderStarted = System.nanoTime()
+        val keepGroundAs = if (drawnShortOfSources) null else groundKey
+        val png =
+            when (content) {
+                Content.LABELS -> renderLabelTile(request, tiles, isCancelled)
+                Content.FULL ->
+                    groundRasters.get(groundKey)?.let { compositeLabels(request, it, tiles) }
+                        ?: renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = keepGroundAs)
+                Content.GEOMETRY -> renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = null)
+            }
+        val renderMs = (System.nanoTime() - renderStarted) / 1_000_000
+
+        if (Log.isLoggable(TAG, Log.DEBUG)) {
+            Log.d(
+                TAG,
+                "tile ${request.z}/${request.x}/${request.y} content=$content " +
+                    "render=${renderMs}ms bytes=${png?.size ?: 0} ${ready.fetchSummary}",
+            )
+        }
+        // Only a tile that is still owed something makes a handover worth
+        // having; one short of a range the server does not have is as
+        // finished as it will get.
+        if (ready.glyphs == Ink.AWAITED) provisionalSinceHandover.set(true)
+        if (png != null && !drawnShortOfSources) {
+            val store = if (drawnShortOfGlyphs) ready.provisionalKey else ready.completeKey
+            if (store != null) diskCache?.put(store, png)
+        }
+        return png
+    }
+
+    /**
+     * Everything before the drawing: the disk cache, then the sources, glyphs
+     * and sprite the tile needs, waited for up to [dataWaitMs]. Null when the
+     * tile was cancelled or the provider closed meanwhile.
+     */
+    private fun gather(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+        content: Content,
+    ): Ready? {
 
         // Two keys, because a rendered tile goes stale for one reason only:
         // it was drawn while some of its glyphs were still on the way. A tile
@@ -854,7 +979,7 @@ class VectorTileProvider private constructor(
                             "bytes=${hit.size}",
                     )
                 }
-                return hit
+                return Ready(hit = hit)
             }
         }
 
@@ -952,61 +1077,26 @@ class VectorTileProvider private constructor(
                     return null
                 }
             }
-        val drawnShortOfGlyphs = glyphs != Ink.COMPLETE
-
-        // The last chance to bail. Past here the work is native and cannot be
-        // interrupted, and it is the part that takes hundreds of milliseconds
-        // -- a tile drawn for a viewport the map has left holds up the tiles
-        // it is waiting for, because the render slots and the GL thread are
-        // shared.
-        if (isCancelled()) {
-            if (Log.isLoggable(TAG, Log.DEBUG)) {
-                Log.d(TAG, "tile ${request.z}/${request.x}/${request.y} dropped before rendering")
-            }
-            return null
-        }
-
-        val renderStarted = System.nanoTime()
-        val groundKey = key("geom")
-        // A tile drawn while the network was off and a source was not in the
-        // package is missing ink, like one drawn short of glyphs -- but
-        // nothing will arrive to redraw it, so it must not be kept at all.
-        // Nor is one drawn before a slow source landed: it is about to be
-        // redrawn whole.
-        val drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0 || stillComing > 0
-        val keepGroundAs = if (drawnShortOfSources) null else groundKey
-        val png =
-            when (content) {
-                Content.LABELS -> renderLabelTile(request, tiles, isCancelled)
-                Content.FULL ->
-                    groundRasters.get(groundKey)?.let { compositeLabels(request, it, tiles) }
-                        ?: renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = keepGroundAs)
-                Content.GEOMETRY -> renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = null)
-            }
-        val renderMs = (System.nanoTime() - renderStarted) / 1_000_000
-
-        if (Log.isLoggable(TAG, Log.DEBUG)) {
-            Log.d(
-                TAG,
-                "tile ${request.z}/${request.x}/${request.y} content=$content " +
-                    "sources=${urls.count { it != null }} planned=${plan.length()} fetch=${fetchMs}ms " +
-                    "render=${renderMs}ms bytes=${png?.size ?: 0} " +
+        return Ready(
+            tiles = tiles,
+            glyphs = glyphs,
+            // A tile drawn while the network was off and a source was not in
+            // the package is missing ink, like one drawn short of glyphs --
+            // but nothing will arrive to redraw it, so it must not be kept at
+            // all. Nor is one drawn before a slow source landed: it is about
+            // to be redrawn whole.
+            drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0 || stillComing > 0,
+            completeKey = completeKey,
+            provisionalKey = provisionalKey,
+            groundKey = key("geom"),
+            fetchSummary =
+                "sources=${urls.count { it != null }} planned=${plan.length()} fetch=${fetchMs}ms " +
                     "mvt(mem=${fetchStats[STAT_MEMORY].get()} local=${fetchStats[STAT_LOCAL].get()} " +
                     "disk=${fetchStats[STAT_DISK].get()} coming=$stillComing " +
                     "net=${fetchStats[STAT_NETWORK].get()} shared=${fetchStats[STAT_SHARED].get()} " +
                     "blocked=${fetchStats[STAT_BLOCKED].get()} cancel=${fetchStats[STAT_CANCELLED].get()} " +
                     "queue=${fetchStats[STAT_QUEUE_MS].get()}ms)",
-            )
-        }
-        // Only a tile that is still owed something makes a handover worth
-        // having; one short of a range the server does not have is as
-        // finished as it will get.
-        if (glyphs == Ink.AWAITED) provisionalSinceHandover.set(true)
-        if (png != null && !drawnShortOfSources) {
-            val store = if (drawnShortOfGlyphs) provisionalKey else completeKey
-            if (store != null) diskCache?.put(store, png)
-        }
-        return png
+        )
     }
 
     /**

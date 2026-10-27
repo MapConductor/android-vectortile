@@ -3,6 +3,7 @@ package com.mapconductor.vectortile
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.mapconductor.core.tileserver.TileRequest
+import com.mapconductor.core.tileserver.TileServerRegistry
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -13,6 +14,8 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.net.Socket
+import java.net.URI
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -132,6 +135,78 @@ class SlowNetworkTest {
                 assertTrue("drawn without its packaged sources", wholeTile(6, 32, 22).contentEquals(png))
             }
     }
+
+    /**
+     * The same, asked for the way a map asks: through the local tile server.
+     *
+     * The provider answering at once was not enough. The server drew every
+     * tile on one of eight workers, and a tile waiting on the hung upstream
+     * held its worker while it waited -- so twenty-four of them took all
+     * eight, and the area's tile queued behind them however fast the
+     * provider would have drawn it. Tiles now wait in prepareTile, outside
+     * the server's render slots.
+     */
+    @Test
+    fun theDownloadedAreaDrawsThroughTheTileServerWhileUpstreamHangs() {
+        val pkg = packageFor(6, 32, 22)
+        val fetcher =
+            OfflinePackage.Fetcher(
+                pkg = pkg,
+                upstream = {
+                    release.await(10, TimeUnit.SECONDS)
+                    null
+                },
+                online = true,
+            )
+        val server = TileServerRegistry.get()
+        val route = "slow-network-${System.nanoTime()}"
+        VectorTileProvider
+            .create(
+                styleJson = styleJson,
+                tileSize = 512,
+                renderScale = 1,
+                renderMode = VectorTileProvider.RenderMode.CPU,
+                fetchTile = fetcher,
+                localTile = { url -> fetcher.local(url) },
+            ).use { provider ->
+                server.register(route, provider.geometryTiles)
+                try {
+                    fun url(
+                        x: Int,
+                        y: Int,
+                    ) = URI(
+                        server
+                            .urlTemplate(route, 512)
+                            .replace("{z}", "6")
+                            .replace("{x}", "$x")
+                            .replace("{y}", "$y"),
+                    )
+                    // Around the area: every one of these waits on upstream.
+                    for (x in 0 until 12) {
+                        for (y in 0 until 2) background.execute { status(url(x, y)) }
+                    }
+                    Thread.sleep(500)
+                    val started = System.nanoTime()
+                    val status = status(url(32, 22))
+                    val seconds = (System.nanoTime() - started) / 1e9
+                    Log.i(TAG, "in-area tile through the server took ${"%.2f".format(seconds)}s $status")
+                    assertTrue("got $status", status.contains("200"))
+                    assertTrue("the in-area tile took ${seconds}s through the server", seconds < 2.0)
+                } finally {
+                    server.unregister(route)
+                }
+            }
+    }
+
+    private fun status(url: URI): String =
+        Socket(url.host, url.port).use { socket ->
+            socket.soTimeout = 30_000
+            socket.getOutputStream().write(
+                "GET ${url.path} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: close\r\n\r\n".toByteArray(),
+            )
+            socket.getOutputStream().flush()
+            socket.getInputStream().bufferedReader(Charsets.ISO_8859_1).readLine() ?: ""
+        }
 
     /** The tile as drawn with every source to hand. */
     private fun wholeTile(

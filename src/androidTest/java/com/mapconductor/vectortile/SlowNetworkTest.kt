@@ -3,6 +3,7 @@ package com.mapconductor.vectortile
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.mapconductor.core.tileserver.TileRequest
+import com.mapconductor.core.tileserver.TileServerRegistry
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -13,6 +14,8 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.net.Socket
+import java.net.URI
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -133,6 +136,78 @@ class SlowNetworkTest {
             }
     }
 
+    /**
+     * The same, asked for the way a map asks: through the local tile server.
+     *
+     * The provider answering at once was not enough. The server drew every
+     * tile on one of eight workers, and a tile waiting on the hung upstream
+     * held its worker while it waited -- so twenty-four of them took all
+     * eight, and the area's tile queued behind them however fast the
+     * provider would have drawn it. Tiles now wait in prepareTile, outside
+     * the server's render slots.
+     */
+    @Test
+    fun theDownloadedAreaDrawsThroughTheTileServerWhileUpstreamHangs() {
+        val pkg = packageFor(6, 32, 22)
+        val fetcher =
+            OfflinePackage.Fetcher(
+                pkg = pkg,
+                upstream = {
+                    release.await(10, TimeUnit.SECONDS)
+                    null
+                },
+                online = true,
+            )
+        val server = TileServerRegistry.get()
+        val route = "slow-network-${System.nanoTime()}"
+        VectorTileProvider
+            .create(
+                styleJson = styleJson,
+                tileSize = 512,
+                renderScale = 1,
+                renderMode = VectorTileProvider.RenderMode.CPU,
+                fetchTile = fetcher,
+                localTile = { url -> fetcher.local(url) },
+            ).use { provider ->
+                server.register(route, provider.geometryTiles)
+                try {
+                    fun url(
+                        x: Int,
+                        y: Int,
+                    ) = URI(
+                        server
+                            .urlTemplate(route, 512)
+                            .replace("{z}", "6")
+                            .replace("{x}", "$x")
+                            .replace("{y}", "$y"),
+                    )
+                    // Around the area: every one of these waits on upstream.
+                    for (x in 0 until 12) {
+                        for (y in 0 until 2) background.execute { status(url(x, y)) }
+                    }
+                    Thread.sleep(500)
+                    val started = System.nanoTime()
+                    val status = status(url(32, 22))
+                    val seconds = (System.nanoTime() - started) / 1e9
+                    Log.i(TAG, "in-area tile through the server took ${"%.2f".format(seconds)}s $status")
+                    assertTrue("got $status", status.contains("200"))
+                    assertTrue("the in-area tile took ${seconds}s through the server", seconds < 2.0)
+                } finally {
+                    server.unregister(route)
+                }
+            }
+    }
+
+    private fun status(url: URI): String =
+        Socket(url.host, url.port).use { socket ->
+            socket.soTimeout = 30_000
+            socket.getOutputStream().write(
+                "GET ${url.path} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: close\r\n\r\n".toByteArray(),
+            )
+            socket.getOutputStream().flush()
+            socket.getInputStream().bufferedReader(Charsets.ISO_8859_1).readLine() ?: ""
+        }
+
     /** The tile as drawn with every source to hand. */
     private fun wholeTile(
         z: Int,
@@ -149,9 +224,10 @@ class SlowNetworkTest {
             ).use { it.geometryTiles.renderTile(TileRequest(x = x, y = y, z = z))!! }
 
     /**
-     * A tile whose source is slow is drawn without it after the grace, is not
-     * kept, and is asked for again -- through [VectorTileProvider.onSourcesLoaded]
-     * -- once the source lands; the redraw is kept.
+     * A tile whose source takes longer than the provider will wait is drawn
+     * without it, is not kept, and is asked for again -- through
+     * [VectorTileProvider.onSourcesLoaded] -- once the source lands; the
+     * redraw is kept. The wait is shortened here from its ten seconds.
      */
     @Test
     fun aTileDrawnShortOfASlowSourceIsRedrawnWhenItLands() {
@@ -168,6 +244,7 @@ class SlowNetworkTest {
                     tileBytes
                 },
             ).use { provider ->
+                provider.dataWaitMs = 500
                 provider.onSourcesLoaded = { arrived.countDown() }
                 val request = TileRequest(x = 0, y = 0, z = 0)
                 val started = System.nanoTime()

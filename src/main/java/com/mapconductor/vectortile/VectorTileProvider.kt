@@ -59,18 +59,26 @@ class VectorTileProvider private constructor(
     val renderMode: RenderMode = if (gpu != null) RenderMode.GPU else RenderMode.CPU
 
     /**
-     * Called when glyphs have arrived and the tiles drawn before them are
-     * missing labels. The layer refetches; nothing here can make the map do
-     * that on its own.
+     * Called when glyphs have arrived that tiles already drawn were missing.
+     *
+     * Not the normal path. A tile waits for the ranges its labels need (up to
+     * [dataWaitMs]) and is answered once, labels and all; this fires only for
+     * tiles that gave up waiting -- a range slower than that, or a sprite
+     * sheet still on its way. The layer refetches; nothing here can make the
+     * map do that on its own.
      */
     @Volatile
     var onGlyphsLoaded: (() -> Unit)? = null
 
     /**
      * Called when source tiles have arrived that tiles already drawn were
-     * missing -- they were drawn without them rather than kept waiting -- or
-     * when a kept source turned out to have changed. Both halves (ground and
-     * labels) are worth redrawing; the layer refetches.
+     * missing, or when a kept source turned out to have changed on the server.
+     *
+     * Not the normal path either. A tile waits for its sources (up to
+     * [dataWaitMs]) and is answered once; this fires only for tiles that were
+     * drawn short because a source took longer than that, and for the rare
+     * revalidation that brings new bytes. Both halves (ground and labels) are
+     * worth redrawing then; the layer refetches.
      */
     @Volatile
     var onSourcesLoaded: (() -> Unit)? = null
@@ -256,13 +264,36 @@ class VectorTileProvider private constructor(
      * Fetches glyph ranges off the tile threads.
      *
      * One range is a round trip of 0.4 to 1.3 seconds and a tile at low zoom
-     * wants dozens, so nothing waits on them: six at a time, and the tiles
-     * that were drawn without them are handed over when they land.
+     * wants dozens. Tiles wait for theirs now (see [loadGlyphs]), so the
+     * ranges a viewport wants have to be in flight together: sixteen at a
+     * time, where six put sixty-nine ranges at thirteen seconds.
      */
     private val glyphFetchers =
-        java.util.concurrent.Executors.newFixedThreadPool(6) { runnable ->
+        java.util.concurrent.Executors.newFixedThreadPool(16) { runnable ->
             Thread(runnable, "mc-glyphs").apply { isDaemon = true }
         }
+
+    /**
+     * Glyph ranges on their way, so every tile that wants one waits on the
+     * same fetch. Completed and removed when the fetch ends, however it ends.
+     */
+    private val glyphFlights =
+        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Unit>>()
+
+    /**
+     * Done once the sprite sheet is in, or known not to be coming. Tiles with
+     * icons wait on it rather than being drawn with holes and handed over.
+     */
+    private val spriteSettled = java.util.concurrent.CompletableFuture<Unit>()
+
+    /**
+     * How long a tile waits for what it has to fetch -- sources, glyph ranges,
+     * the sprite sheet -- before it is drawn with what it has.
+     *
+     * A variable only so tests can shorten it; see [DATA_WAIT_MS].
+     */
+    @Volatile
+    internal var dataWaitMs: Long = DATA_WAIT_MS
 
     /** True when the style names no glyph source, so labels can never draw. */
     private val glyphsUnavailable: Boolean = renderer.glyphsUrlTemplate() == null
@@ -282,6 +313,7 @@ class VectorTileProvider private constructor(
         val cache = glyphCache
         if (cache == null && !renderer.needsSprite()) {
             glyphsWarmed.countDown()
+            spriteSettled.complete(Unit)
         } else {
             Thread({
                 val started = System.nanoTime()
@@ -302,7 +334,11 @@ class VectorTileProvider private constructor(
                 }
                 // Only then the network, so a cold start does not hold the
                 // first tile behind two more round trips.
-                fetchSpriteIfMissing()
+                try {
+                    fetchSpriteIfMissing()
+                } finally {
+                    spriteSettled.complete(Unit)
+                }
             }, "mc-style-assets").apply { isDaemon = true }.start()
         }
     }
@@ -486,17 +522,25 @@ class VectorTileProvider private constructor(
         private const val STAT_COUNT = 8
 
         /**
-         * How long a tile waits for sources that have to come over the network.
+         * How long a tile waits for what has to come over the network -- its
+         * sources, the glyph ranges its labels use, the sprite sheet.
          *
-         * Past this it is drawn with what it has and redrawn when the rest
-         * lands (see [onSourcesLoaded]). Waiting for all of them was right on
-         * a good network and wrong on a bad one: on a Wi-Fi that connects and
-         * then answers nothing, a fetch takes its full fifteen-second timeout,
-         * and every tile on screen waited for its slowest neighbour -- the
-         * map stayed white, the downloaded area included. On a good network
-         * a tile's sources are in long before this and nothing changes.
+         * Each tile is answered once, complete: drawing it early and handing
+         * the whole layer over when the rest landed made every zoom show its
+         * tiles and then load them all again. So a tile waits, and only past
+         * this is it drawn with what it has and redrawn when the rest lands
+         * (see [onSourcesLoaded], [onGlyphsLoaded]).
+         *
+         * What the device holds never waits on this: a package or kept source
+         * is read on the asking thread, so on a Wi-Fi that answers nothing the
+         * downloaded area still draws at once. The bound is for the network,
+         * and it sits under the fetch's own fifteen-second timeout so a dead
+         * connection costs a tile drawn short, not a map that never draws.
          */
-        internal const val SOURCE_GRACE_MS: Long = 400
+        internal const val DATA_WAIT_MS: Long = 10_000
+
+        /** Tiles kept between [prepare] and their render; see [prepared]. */
+        private const val MAX_PREPARED = 64
         private const val AWAIT_SLICE_NANOS: Long = 50_000_000
 
         /**
@@ -723,6 +767,11 @@ class VectorTileProvider private constructor(
         isCancelled: () -> Boolean,
     ): ByteArray? = renderTile(request, isCancelled, Content.FULL)
 
+    override fun prepareTile(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+    ) = prepare(request, isCancelled, Content.FULL)
+
     /** What one of this provider's routes serves. */
     private enum class Content { FULL, GEOMETRY, LABELS }
 
@@ -743,6 +792,11 @@ class VectorTileProvider private constructor(
                 request: TileRequest,
                 isCancelled: () -> Boolean,
             ): ByteArray? = renderTile(request, isCancelled, Content.GEOMETRY)
+
+            override fun prepareTile(
+                request: TileRequest,
+                isCancelled: () -> Boolean,
+            ) = prepare(request, isCancelled, Content.GEOMETRY)
         }
 
     /** The labels and icons alone, on a transparent ground. */
@@ -754,7 +808,57 @@ class VectorTileProvider private constructor(
                 request: TileRequest,
                 isCancelled: () -> Boolean,
             ): ByteArray? = renderTile(request, isCancelled, Content.LABELS)
+
+            override fun prepareTile(
+                request: TileRequest,
+                isCancelled: () -> Boolean,
+            ) = prepare(request, isCancelled, Content.LABELS)
         }
+
+    /**
+     * A tile with everything it waited for, ready to draw -- or, in [hit],
+     * already drawn.
+     */
+    private class Ready(
+        val hit: ByteArray? = null,
+        val tiles: List<ByteArray?> = emptyList(),
+        val glyphs: Ink = Ink.COMPLETE,
+        val drawnShortOfSources: Boolean = false,
+        val completeKey: String? = null,
+        val provisionalKey: String? = null,
+        val groundKey: String = "",
+        val fetchSummary: String = "",
+    )
+
+    /**
+     * Tiles [prepare] got ready, waiting for the server to draw them. Bounded:
+     * a tile the map abandoned between the two is never drawn, and its entry
+     * goes when newer ones push it out.
+     */
+    private val prepared =
+        object : LinkedHashMap<Pair<Content, TileRequest>, Ready>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<Content, TileRequest>, Ready>?) =
+                size > MAX_PREPARED
+        }
+
+    /**
+     * Fetches what the tile needs -- its sources, its glyphs and sprite --
+     * waiting for them, and keeps the result for [renderTile].
+     *
+     * The server calls this outside its render slots
+     * ([TileProviderInterface.prepareTile]), so a tile waiting here on a
+     * network that is not answering holds no slot, and a tile on the device
+     * is not queued behind it. The render that follows does not wait again.
+     */
+    private fun prepare(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+        content: Content,
+    ) {
+        if (closed) return
+        val ready = gather(request, isCancelled, content) ?: return
+        synchronized(prepared) { prepared[content to request] = ready }
+    }
 
     private fun renderTile(
         request: TileRequest,
@@ -762,6 +866,68 @@ class VectorTileProvider private constructor(
         content: Content,
     ): ByteArray? {
         if (closed) return null
+        val ready =
+            synchronized(prepared) { prepared.remove(content to request) }
+                ?: gather(request, isCancelled, content)
+                ?: return null
+        ready.hit?.let { return it }
+
+        // The last chance to bail. Past here the work is native and cannot be
+        // interrupted, and it is the part that takes hundreds of milliseconds
+        // -- a tile drawn for a viewport the map has left holds up the tiles
+        // it is waiting for, because the render slots and the GL thread are
+        // shared.
+        if (isCancelled()) {
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "tile ${request.z}/${request.x}/${request.y} dropped before rendering")
+            }
+            return null
+        }
+
+        val tiles = ready.tiles
+        val groundKey = ready.groundKey
+        val drawnShortOfSources = ready.drawnShortOfSources
+        val drawnShortOfGlyphs = ready.glyphs != Ink.COMPLETE
+        val renderStarted = System.nanoTime()
+        val keepGroundAs = if (drawnShortOfSources) null else groundKey
+        val png =
+            when (content) {
+                Content.LABELS -> renderLabelTile(request, tiles, isCancelled)
+                Content.FULL ->
+                    groundRasters.get(groundKey)?.let { compositeLabels(request, it, tiles) }
+                        ?: renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = keepGroundAs)
+                Content.GEOMETRY -> renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = null)
+            }
+        val renderMs = (System.nanoTime() - renderStarted) / 1_000_000
+
+        if (Log.isLoggable(TAG, Log.DEBUG)) {
+            Log.d(
+                TAG,
+                "tile ${request.z}/${request.x}/${request.y} content=$content " +
+                    "render=${renderMs}ms bytes=${png?.size ?: 0} ${ready.fetchSummary}",
+            )
+        }
+        // Only a tile that is still owed something makes a handover worth
+        // having; one short of a range the server does not have is as
+        // finished as it will get.
+        if (ready.glyphs == Ink.AWAITED) provisionalSinceHandover.set(true)
+        if (png != null && !drawnShortOfSources) {
+            val store = if (drawnShortOfGlyphs) ready.provisionalKey else ready.completeKey
+            if (store != null) diskCache?.put(store, png)
+        }
+        return png
+    }
+
+    /**
+     * Everything before the drawing: the disk cache, then the sources, glyphs
+     * and sprite the tile needs, waited for up to [dataWaitMs]. Null when the
+     * tile was cancelled or the provider closed meanwhile.
+     */
+    private fun gather(
+        request: TileRequest,
+        isCancelled: () -> Boolean,
+        content: Content,
+    ): Ready? {
 
         // Two keys, because a rendered tile goes stale for one reason only:
         // it was drawn while some of its glyphs were still on the way. A tile
@@ -813,7 +979,7 @@ class VectorTileProvider private constructor(
                             "bytes=${hit.size}",
                     )
                 }
-                return hit
+                return Ready(hit = hit)
             }
         }
 
@@ -857,14 +1023,15 @@ class VectorTileProvider private constructor(
                 val url = urls[index] ?: return@forEach
                 pending[index] = resolveSource(url, fetchStats)
             }
-        val outcomes = awaitSources(pending, fetchStarted + SOURCE_GRACE_MS * 1_000_000, isCancelled)
+        val deadline = fetchStarted + dataWaitMs * 1_000_000
+        val outcomes = awaitSources(pending, deadline, isCancelled)
         if (outcomes == null) {
             fetchStats[STAT_CANCELLED].addAndGet(pending.count { it?.flight != null }.toLong())
             pending.forEach { it?.flight?.leave() }
             return null
         }
-        // Drawn now without the ones still on their way; they stay held, and
-        // the tile is redrawn when they land.
+        // Past the deadline: drawn now without the ones still on their way;
+        // they stay held, and the tile is redrawn when they land.
         var stillComing = 0
         for (index in pending.indices) {
             val source = pending[index] ?: continue
@@ -896,62 +1063,40 @@ class VectorTileProvider private constructor(
             }
         }
 
-        // Short of its sheet counts the same as short of its glyphs: the tile
-        // is missing ink it will have later.
-        val drawnShortOfGlyphs =
-            content != Content.GEOMETRY &&
-                (requestGlyphs(request, tiles) || renderer.needsSprite())
-
-        // The last chance to bail. Past here the work is native and cannot be
-        // interrupted, and it is the part that takes hundreds of milliseconds
-        // -- a tile drawn for a viewport the map has left holds up the tiles
-        // it is waiting for, because the render slots and the GL thread are
-        // shared.
-        if (isCancelled()) {
-            if (Log.isLoggable(TAG, Log.DEBUG)) {
-                Log.d(TAG, "tile ${request.z}/${request.x}/${request.y} dropped before rendering")
+        // Its labels' glyphs and its icons' sheet are waited for, like its
+        // sources, so the tile is answered once with its labels on it. Short
+        // of either counts the same: the tile is missing ink.
+        val glyphs =
+            if (content == Content.GEOMETRY) {
+                Ink.COMPLETE
+            } else {
+                loadGlyphs(request, tiles, deadline, isCancelled) ?: run {
+                    if (Log.isLoggable(TAG, Log.DEBUG)) {
+                        Log.d(TAG, "tile ${request.z}/${request.x}/${request.y} dropped waiting for glyphs")
+                    }
+                    return null
+                }
             }
-            return null
-        }
-
-        val renderStarted = System.nanoTime()
-        val groundKey = key("geom")
-        // A tile drawn while the network was off and a source was not in the
-        // package is missing ink, like one drawn short of glyphs -- but
-        // nothing will arrive to redraw it, so it must not be kept at all.
-        // Nor is one drawn before a slow source landed: it is about to be
-        // redrawn whole.
-        val drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0 || stillComing > 0
-        val keepGroundAs = if (drawnShortOfSources) null else groundKey
-        val png =
-            when (content) {
-                Content.LABELS -> renderLabelTile(request, tiles, isCancelled)
-                Content.FULL ->
-                    groundRasters.get(groundKey)?.let { compositeLabels(request, it, tiles) }
-                        ?: renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = keepGroundAs)
-                Content.GEOMETRY -> renderGroundTile(request, tiles, isCancelled, content, cacheGroundAs = null)
-            }
-        val renderMs = (System.nanoTime() - renderStarted) / 1_000_000
-
-        if (Log.isLoggable(TAG, Log.DEBUG)) {
-            Log.d(
-                TAG,
-                "tile ${request.z}/${request.x}/${request.y} content=$content " +
-                    "sources=${urls.count { it != null }} planned=${plan.length()} fetch=${fetchMs}ms " +
-                    "render=${renderMs}ms bytes=${png?.size ?: 0} " +
+        return Ready(
+            tiles = tiles,
+            glyphs = glyphs,
+            // A tile drawn while the network was off and a source was not in
+            // the package is missing ink, like one drawn short of glyphs --
+            // but nothing will arrive to redraw it, so it must not be kept at
+            // all. Nor is one drawn before a slow source landed: it is about
+            // to be redrawn whole.
+            drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0 || stillComing > 0,
+            completeKey = completeKey,
+            provisionalKey = provisionalKey,
+            groundKey = key("geom"),
+            fetchSummary =
+                "sources=${urls.count { it != null }} planned=${plan.length()} fetch=${fetchMs}ms " +
                     "mvt(mem=${fetchStats[STAT_MEMORY].get()} local=${fetchStats[STAT_LOCAL].get()} " +
                     "disk=${fetchStats[STAT_DISK].get()} coming=$stillComing " +
                     "net=${fetchStats[STAT_NETWORK].get()} shared=${fetchStats[STAT_SHARED].get()} " +
                     "blocked=${fetchStats[STAT_BLOCKED].get()} cancel=${fetchStats[STAT_CANCELLED].get()} " +
                     "queue=${fetchStats[STAT_QUEUE_MS].get()}ms)",
-            )
-        }
-        if (drawnShortOfGlyphs) provisionalSinceHandover.set(true)
-        if (png != null && !drawnShortOfSources) {
-            val store = if (drawnShortOfGlyphs) provisionalKey else completeKey
-            if (store != null) diskCache?.put(store, png)
-        }
-        return png
+        )
     }
 
     /**
@@ -1168,36 +1313,54 @@ class VectorTileProvider private constructor(
         com.mapconductor.core.tileserver.TilePngEncoder
             .encode(rgba, resolution, resolution, premultiplied = true)
 
+    /** How far a tile's glyphs and icons got. */
+    private enum class Ink {
+        /** Everything its labels and icons need is in. */
+        COMPLETE,
+
+        /** Something is missing that is not coming: a range the server lacks. */
+        SHORT,
+
+        /** Something is missing and still on its way; the tile is handed over when it lands. */
+        AWAITED,
+    }
+
     /**
-     * Starts fetching the glyph ranges this tile's labels need, and returns.
+     * Loads the glyph ranges this tile's labels need, and the sprite sheet
+     * when the style draws icons, waiting for them until [deadlineNanos].
      *
-     * Waiting was the obvious thing and the wrong one: a range is a 0.4 to 1.3
-     * second round trip, a tile at low zoom wants dozens, and the tile drew
-     * nothing until the last one landed — 13 seconds for 69 ranges, which is
-     * what "it stops when you zoom out" was. The tile is drawn with whatever
-     * glyphs are already in, exactly as MapLibre does it, and the ones that
-     * arrive later bring the labels with them through [onGlyphsLoaded].
+     * Not waiting was tried, and drawn early it was: the tile went out with
+     * whatever glyphs were in, and the ones that arrived later brought the
+     * labels through a handover that refetched every tile on screen -- after
+     * every zoom the map showed its tiles and then loaded them all again. A
+     * range is a 0.4 to 1.3 second round trip, so waiting for the few a tile
+     * wants costs about one of them; the ranges are shared between tiles, so
+     * a viewport waits for its ranges once, not once per tile.
      *
-     * Returns whether this tile is about to be drawn without glyphs it wants,
-     * which is what decides between the two cache keys and whether a handover
-     * is worth making.
+     * Returns how complete the tile's ink is, or null when it was cancelled
+     * while waiting.
      */
-    private fun requestGlyphs(
+    private fun loadGlyphs(
         request: TileRequest,
         tiles: List<ByteArray?>,
-    ): Boolean {
-        if (glyphsUnavailable || closed) return false
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+    ): Ink? {
+        val waits = ArrayList<java.util.concurrent.CompletableFuture<Unit>>()
+        if (renderer.needsSprite()) waits.add(spriteSettled)
         var needed =
-            runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
-                .getOrElse { emptyList() }
-        if (needed.isEmpty()) return false
+            if (glyphsUnavailable || closed) {
+                emptyList()
+            } else {
+                runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
+                    .getOrElse { emptyList() }
+            }
 
         // Ranges the device holds go in now, on this thread. Through the
         // fetch threads they would wait behind ranges on their way over a
-        // network that may not be answering, and the tile would be drawn
-        // without labels it had all along.
+        // network that may not be answering.
         val local = localTile
-        if (local != null) {
+        if (local != null && needed.isNotEmpty()) {
             var added = 0
             for (url in needed) {
                 if (!requestedGlyphs.add(url)) continue
@@ -1214,56 +1377,110 @@ class VectorTileProvider private constructor(
                 needed =
                     runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
                         .getOrElse { emptyList() }
-                if (needed.isEmpty()) return false
             }
         }
 
-        // Only the ranges nobody has claimed yet. Two tiles wanting the same
-        // range at once would otherwise both fetch it.
-        val mine = needed.filter { requestedGlyphs.add(it) }
-        if (mine.isEmpty()) return true
+        for (url in needed) {
+            // Joined when someone is already fetching it. A range claimed
+            // with no fetch under way was asked for and not there; asking
+            // again would get the same answer.
+            val flying = glyphFlights[url]
+            if (flying != null) {
+                waits.add(flying)
+                continue
+            }
+            if (url in requestedGlyphs) continue
+            val mine = java.util.concurrent.CompletableFuture<Unit>()
+            val existing = glyphFlights.putIfAbsent(url, mine)
+            if (existing != null) {
+                waits.add(existing)
+                continue
+            }
+            requestedGlyphs.add(url)
+            waits.add(mine)
+            fetchGlyphRange(url, mine)
+        }
+        if (waits.isEmpty()) return Ink.COMPLETE
 
-        for (url in mine) {
-            glyphsInFlight.incrementAndGet()
-            val queued =
-                runCatching {
-                    glyphFetchers.execute {
-                        try {
-                            if (closed) return@execute
-                            val cached = glyphCache?.get(url)
-                            val fetched = if (cached != null) Result.success(cached) else runCatching { fetchTile(url) }
-                            if (fetched.exceptionOrNull() is OfflineUnavailableException) {
-                                // Unclaimed: the range is there to be had
-                                // once the network is back.
-                                requestedGlyphs.remove(url)
-                                return@execute
-                            }
-                            val bytes =
-                                fetched.getOrNull()?.also {
-                                    // Ranges do not change, so this is kept
-                                    // without an expiry.
-                                    if (cached == null) glyphCache?.put(url, it)
-                                }
-                            if (bytes == null || bytes.isEmpty()) {
-                                // Left in the claimed set: a range the server
-                                // does not have will not appear on a retry.
-                                Log.w(TAG, "glyph range unavailable: $url")
-                                return@execute
-                            }
-                            val added =
-                                runCatching { renderer.addGlyphs(bytes) }.getOrElse {
-                                    Log.w(TAG, "glyph range would not parse: $url", it)
-                                    0
-                                }
-                            if (added > 0) onGlyphsArrived()
-                        } finally {
-                            glyphsInFlight.decrementAndGet()
+        for (future in waits) {
+            while (!future.isDone) {
+                if (closed || isCancelled()) return null
+                val remaining = deadlineNanos - System.nanoTime()
+                if (remaining <= 0) break
+                try {
+                    future.get(minOf(remaining, AWAIT_SLICE_NANOS), java.util.concurrent.TimeUnit.NANOSECONDS)
+                } catch (_: java.util.concurrent.TimeoutException) {
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+
+        val stillComing = waits.any { !it.isDone }
+        val stillNeeded =
+            !glyphsUnavailable &&
+                runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
+                    .getOrElse { emptyList() }
+                    .isNotEmpty()
+        val iconsMissing = renderer.needsSprite()
+        return when {
+            stillComing -> Ink.AWAITED
+            stillNeeded || iconsMissing -> Ink.SHORT
+            else -> Ink.COMPLETE
+        }
+    }
+
+    /** Fetches one glyph range on [glyphFetchers]; [done] completes however it ends. */
+    private fun fetchGlyphRange(
+        url: String,
+        done: java.util.concurrent.CompletableFuture<Unit>,
+    ) {
+        glyphsInFlight.incrementAndGet()
+        val finish = {
+            glyphFlights.remove(url, done)
+            glyphsInFlight.decrementAndGet()
+            done.complete(Unit)
+        }
+        val queued =
+            runCatching {
+                glyphFetchers.execute {
+                    try {
+                        if (closed) return@execute
+                        val cached = glyphCache?.get(url)
+                        val fetched = if (cached != null) Result.success(cached) else runCatching { fetchTile(url) }
+                        if (fetched.exceptionOrNull() is OfflineUnavailableException) {
+                            // Unclaimed: the range is there to be had
+                            // once the network is back.
+                            requestedGlyphs.remove(url)
+                            return@execute
                         }
+                        val bytes =
+                            fetched.getOrNull()?.also {
+                                // Ranges do not change, so this is kept
+                                // without an expiry.
+                                if (cached == null) glyphCache?.put(url, it)
+                            }
+                        if (bytes == null || bytes.isEmpty()) {
+                            // Left in the claimed set: a range the server
+                            // does not have will not appear on a retry.
+                            Log.w(TAG, "glyph range unavailable: $url")
+                            return@execute
+                        }
+                        val added =
+                            runCatching { renderer.addGlyphs(bytes) }.getOrElse {
+                                Log.w(TAG, "glyph range would not parse: $url", it)
+                                0
+                            }
+                        if (added > 0) onGlyphsArrived()
+                    } finally {
+                        finish()
                     }
                 }
-            if (queued.isFailure) glyphsInFlight.decrementAndGet()
+            }
+        if (queued.isFailure) {
+            requestedGlyphs.remove(url)
+            finish()
         }
-        return true
     }
 
     /**

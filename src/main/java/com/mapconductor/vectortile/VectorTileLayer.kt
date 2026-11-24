@@ -273,14 +273,15 @@ fun MapViewScope.VectorTileLayer(
     // Parsing a real basemap style is not free, so it happens once and off the
     // main thread; the layer simply does not mount until it is ready.
     var provider by remember { mutableStateOf<VectorTileProvider?>(null) }
-    // Bumped when glyphs land. The map only refetches a raster source whose
-    // URL changed, so the generation has to reach the template.
+    // Bumped when glyphs land that tiles were drawn without. Rare: a tile
+    // waits for its ranges and is answered once, labels and all; only one
+    // that gave up waiting is handed over. The map only refetches a raster
+    // source whose URL changed, so the generation has to reach the template.
     var glyphGeneration by remember { mutableIntStateOf(0) }
 
-    // Bumped when sources land that tiles were drawn without -- on a slow
-    // network a tile is drawn with what it has rather than kept waiting -- or
-    // when a kept source changed. Both halves were drawn from them, so both
-    // are handed over.
+    // Bumped when sources land that tiles were drawn without -- only past the
+    // provider's wait, on a network slower than that -- or when a kept source
+    // changed. Both halves were drawn from them, so both are handed over.
     var sourceGeneration by remember { mutableIntStateOf(0) }
     var failure by remember { mutableStateOf<String?>(null) }
 
@@ -316,9 +317,9 @@ fun MapViewScope.VectorTileLayer(
             }
         created
             .onSuccess {
-                // Glyphs arrive after the tiles that need them: a range is a
-                // round trip and a tile at low zoom wants dozens, so tiles are
-                // drawn with whatever is loaded and refetched once more is.
+                // Tiles wait for their glyphs and sources, so these fire only
+                // for the ones that gave up waiting; the layer is not handed
+                // over as a matter of course.
                 it.onGlyphsLoaded = { glyphGeneration++ }
                 it.onSourcesLoaded = {
                     sourceGeneration++

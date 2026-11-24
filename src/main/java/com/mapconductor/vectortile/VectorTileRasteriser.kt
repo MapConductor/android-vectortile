@@ -140,11 +140,10 @@ class VectorTileRasteriser(
             )
 
         /**
-         * Glyphs arrive after the tiles that need them -- a range is a round
-         * trip and a low zoom wants dozens -- so tiles are drawn with what is
-         * loaded and the labels refetched once more is. Sources too, on a
-         * slow network: a tile is drawn with what has arrived, and both
-         * halves are refetched once the rest has.
+         * A tile waits for its glyphs and sources and is answered once; these
+         * fire only for tiles that gave up waiting (a network slower than the
+         * provider's wait) or a kept source that changed. Labels are
+         * refetched for glyphs, both halves for sources.
          */
         private fun watch(created: VectorTileProvider) {
             created.onGlyphsLoaded = {

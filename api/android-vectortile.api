@@ -310,7 +310,7 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public static final long DEFAULT_DISK_CACHE_BYTES;
   public static final long DEFAULT_GLYPH_CACHE_BYTES;
   public static final long DEFAULT_SPRITE_CACHE_BYTES;
-  public static final long SOURCE_GRACE_MS;
+  public static final long DATA_WAIT_MS;
   public final com.mapconductor.vectortile.VectorTileProvider$RenderMode getRenderMode();
   public final kotlin.jvm.functions.Function0<kotlin.Unit> getOnGlyphsLoaded();
   public final void setOnGlyphsLoaded(kotlin.jvm.functions.Function0<kotlin.Unit>);
@@ -324,6 +324,7 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public final void setStyle(java.lang.String);
   public byte[] renderTile(com.mapconductor.core.tileserver.TileRequest);
   public byte[] renderTile(com.mapconductor.core.tileserver.TileRequest, kotlin.jvm.functions.Function0<java.lang.Boolean>);
+  public void prepareTile(com.mapconductor.core.tileserver.TileRequest, kotlin.jvm.functions.Function0<java.lang.Boolean>);
   public final com.mapconductor.core.tileserver.TileProviderInterface getGeometryTiles();
   public final com.mapconductor.core.tileserver.TileProviderInterface getLabelTiles();
   public final void closeAsync();
@@ -368,9 +369,27 @@ final class com.mapconductor.vectortile.VectorTileProvider$Flight {
   public final synchronized void leave();
   public final synchronized boolean abandonIfUnwanted();
 }
+final class com.mapconductor.vectortile.VectorTileProvider$Ink extends java.lang.Enum<com.mapconductor.vectortile.VectorTileProvider$Ink> {
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink COMPLETE;
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink SHORT;
+  public static final com.mapconductor.vectortile.VectorTileProvider$Ink AWAITED;
+  public static com.mapconductor.vectortile.VectorTileProvider$Ink[] values();
+  public static com.mapconductor.vectortile.VectorTileProvider$Ink valueOf(java.lang.String);
+  public static kotlin.enums.EnumEntries<com.mapconductor.vectortile.VectorTileProvider$Ink> getEntries();
+}
 final class com.mapconductor.vectortile.VectorTileProvider$Pending {
   public final java.util.concurrent.CompletableFuture<com.mapconductor.vectortile.VectorTileProvider$SourceOutcome> getFuture();
   public final com.mapconductor.vectortile.VectorTileProvider$Flight getFlight();
+}
+final class com.mapconductor.vectortile.VectorTileProvider$Ready {
+  public final byte[] getHit();
+  public final java.util.List<byte[]> getTiles();
+  public final com.mapconductor.vectortile.VectorTileProvider$Ink getGlyphs();
+  public final boolean getDrawnShortOfSources();
+  public final java.lang.String getCompleteKey();
+  public final java.lang.String getProvisionalKey();
+  public final java.lang.String getGroundKey();
+  public final java.lang.String getFetchSummary();
 }
 public final class com.mapconductor.vectortile.VectorTileProvider$RenderMode extends java.lang.Enum<com.mapconductor.vectortile.VectorTileProvider$RenderMode> {
   public static final com.mapconductor.vectortile.VectorTileProvider$RenderMode CPU;

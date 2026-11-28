@@ -33,6 +33,9 @@ internal class SourceRevalidator(
     /** URLs asked about or waiting to be, so a viewport asks once per tile. */
     private val pending = ConcurrentHashMap.newKeySet<String>()
 
+    /** Revalidations queued or running, so a handover can wait for the burst to end. */
+    val inFlight: Int get() = pending.size
+
     @Volatile
     private var closed = false
 

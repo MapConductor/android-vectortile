@@ -227,8 +227,10 @@ class VectorTileRasteriser(
         override fun dispose() {
             if (!disposed.compareAndSet(false, true)) return
             main.post {
-                host.removeRaster("$groupId-geom")
-                host.removeRaster("$groupId-labels")
+                mountedGround.forEach { host.removeRaster(it) }
+                mountedGround.clear()
+                mountedLabels.forEach { host.removeRaster(it) }
+                mountedLabels.clear()
             }
             host.tileServer.unregister("$groupId-geom")
             host.tileServer.unregister("$groupId-labels")
@@ -236,11 +238,38 @@ class VectorTileRasteriser(
             provider = null
         }
 
+        /**
+         * The layers currently mounted for each half: normally one, briefly
+         * two. Touched on the main thread only.
+         *
+         * Changing a raster layer's source is remove-then-add on the map, so
+         * the half would vanish -- and the map show the deepest tile it still
+         * has, magnified -- for as long as the new source takes its first
+         * tiles. The replacement goes up alongside under its own id and the
+         * old one comes down a moment later, as in [VectorTileLayer].
+         */
+        private val mountedGround = ArrayDeque<String>()
+        private val mountedLabels = ArrayDeque<String>()
+
+        private fun handOver(
+            mounted: ArrayDeque<String>,
+            state: RasterLayerState,
+        ) {
+            if (mounted.lastOrNull() == state.id) return
+            host.upsertRaster(state)
+            mounted.addLast(state.id)
+            main.postDelayed({
+                if (disposed.get()) return@postDelayed
+                while (mounted.size > 1) host.removeRaster(mounted.removeFirst())
+            }, HANDOVER_MS)
+        }
+
         /** Geometry only, drawn by the GPU, never invalidated by glyphs. */
         private fun mountGround() {
-            host.upsertRaster(
+            handOver(
+                mountedGround,
                 RasterLayerState(
-                    id = "$groupId-geom",
+                    id = "$groupId-geom-g$groundGeneration",
                     source =
                         RasterLayerSource.UrlTemplate(
                             template = host.tileServer.urlTemplate("$groupId-geom", tileSize, "g$groundGeneration"),
@@ -251,7 +280,8 @@ class VectorTileRasteriser(
                         ),
                     visible = true,
                     // Under everything the app declared, and under the
-                    // labels. A style *is* the basemap here.
+                    // labels. A style *is* the basemap here. Every
+                    // generation at the same level: both draw the same map.
                     zIndex = -2,
                 ),
             )
@@ -259,9 +289,10 @@ class VectorTileRasteriser(
 
         /** The transparent overlay the glyphs land on. */
         private fun mountLabels() {
-            host.upsertRaster(
+            handOver(
+                mountedLabels,
                 RasterLayerState(
-                    id = "$groupId-labels",
+                    id = "$groupId-labels-g$labelGeneration",
                     source =
                         RasterLayerSource.UrlTemplate(
                             template = host.tileServer.urlTemplate("$groupId-labels", tileSize, "g$labelGeneration"),
@@ -281,6 +312,9 @@ class VectorTileRasteriser(
 
         private companion object {
             const val MAX_ZOOM = 22
+
+            /** How long a replaced half stays up. Matches `HANDOVER_MS` in VectorTileLayer. */
+            private val HANDOVER_MS = 900L
 
             /**
              * Where a style is parsed and redrawn. Daemon threads and few: a

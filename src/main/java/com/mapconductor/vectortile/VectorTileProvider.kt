@@ -1817,8 +1817,11 @@ class VectorTileProvider private constructor(
      * Coalesced like [onGlyphsArrived], for the same reason: sources land in
      * bursts, and a refetch per arrival would redraw the screen over and over
      * to reach one picture. The window is held while sources drawn-short tiles
-     * are waiting on are still in flight, up to a cap, so a bad network does
-     * not turn into a redraw every few hundred milliseconds.
+     * are waiting on, or revalidations, are still in flight, up to a cap, so
+     * a bad network does not turn into a redraw every few hundred
+     * milliseconds. Revalidations come in bursts too: a cache left for weeks
+     * is asked about tile by tile when the map opens, and upstream data that
+     * changed meanwhile would otherwise hand the layer over once per answer.
      */
     private fun onSourcesArrived() {
         if (!sourcesNotifyPending.compareAndSet(false, true)) return
@@ -1827,7 +1830,7 @@ class VectorTileProvider private constructor(
                 val deadline = System.nanoTime() + glyphNotifyMaxWaitMs * 1_000_000L
                 try {
                     Thread.sleep(glyphNotifyQuietMs)
-                    while (awaitedSources.get() > 0 && System.nanoTime() < deadline && !closed) {
+                    while (sourcesStillComing() && System.nanoTime() < deadline && !closed) {
                         Thread.sleep(glyphNotifyQuietMs)
                     }
                 } catch (_: InterruptedException) {
@@ -1849,6 +1852,8 @@ class VectorTileProvider private constructor(
         waiter.name = "mc-source-notify"
         waiter.start()
     }
+
+    private fun sourcesStillComing(): Boolean = awaitedSources.get() > 0 || (revalidator?.inFlight ?: 0) > 0
 
     private val closeStarted =
         java.util.concurrent.atomic

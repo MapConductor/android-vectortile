@@ -239,6 +239,7 @@ public final class com.mapconductor.vectortile.SourceRevalidator implements java
   public static final int DEFAULT_QUEUE;
   public com.mapconductor.vectortile.SourceRevalidator(com.mapconductor.vectortile.SourceTileCache, com.mapconductor.vectortile.ConditionalFetch, kotlin.jvm.functions.Function2<? super java.lang.String, ? super byte[], kotlin.Unit>, int, int);
   public com.mapconductor.vectortile.SourceRevalidator(com.mapconductor.vectortile.SourceTileCache, com.mapconductor.vectortile.ConditionalFetch, kotlin.jvm.functions.Function2, int, int, int, kotlin.jvm.internal.DefaultConstructorMarker);
+  public final int getInFlight();
   public final void revalidate(java.lang.String, com.mapconductor.vectortile.SourceTileCache$Entry);
   public void close();
 }
